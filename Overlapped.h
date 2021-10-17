@@ -6,7 +6,6 @@
 #include <windows.h>
 #include <timeapi.h>
 #include "Convertation.h"
-#undef max
 
 
 size_t callback_count = 0;
@@ -32,23 +31,30 @@ void action_file_overlapped(
 	const HANDLE& file,
 	const size_t& block_size,
 	const size_t& operations_count,
-	int l_file_size,
+	int64_t full_source_size,
 	BYTE**& buffer,
 	OVERLAPPED*& over) 
 {
 	size_t s_operations_count = 0;
-	for (size_t i = 0; i < operations_count; ++i) {
-		if (l_file_size > 0) {
-			++s_operations_count;
-			func(file, buffer[i], block_size, &over[i], FileIOCompletionRoutine);
-			l_file_size -= block_size;
-		}
+	for (size_t i = 0; i < operations_count && full_source_size > 0; ++i) {
+		++s_operations_count;
+		func(file, buffer[i], block_size, &over[i], FileIOCompletionRoutine);
+		full_source_size -= block_size;
 	}
+
 	while (callback_count < s_operations_count)
 		SleepEx(SIZE_MAX, true);
-	for (size_t i = 0; i < operations_count; i++)
-		over[i].Offset += block_size * operations_count;
 	callback_count = 0;
+}
+
+void offset_refresh(int op_count, int block_size, int64_t* last_offset, OVERLAPPED* ol_read, OVERLAPPED* ol_write) {
+	for (size_t i = 0; i < op_count; i++) {
+		ol_write[i].Offset = static_cast<uint32_t>(*last_offset);
+		ol_write[i].OffsetHigh = static_cast<uint32_t>(*last_offset >> 32);
+		ol_read[i].Offset = ol_write[i].Offset;
+		ol_read[i].OffsetHigh = ol_write[i].OffsetHigh;
+		*last_offset += block_size;
+	}
 }
 
 LONGLONG time_calculation(const LARGE_INTEGER& start, const LARGE_INTEGER& end, const LARGE_INTEGER& freq) {
@@ -85,34 +91,35 @@ void overlaped_copy(std::vector<std::string>* property) {
 
 		BYTE** buffer = get_new_buffer(operations_count, block_size);
 
-		int l_source_size = 0;
+		uint32_t l_source_size = 0;
 		DWORD* h_source_size = new DWORD;
 		l_source_size = GetFileSize(source, h_source_size);
-		
+		int64_t* full_source_size = new int64_t;
+		int64_t* last_offset = new int64_t;
+		*full_source_size = (static_cast<long long>(*h_source_size) << 32) + static_cast<long long>(l_source_size);
+		*last_offset = 0;
+
+
 		OVERLAPPED* ol_read = new OVERLAPPED[operations_count];
 		OVERLAPPED* ol_write = new OVERLAPPED[operations_count];
 
-		for (size_t i = 0; i < operations_count; ++i) {
-			ol_write[i].Offset = i * block_size;
-			ol_write[i].OffsetHigh = i * *h_source_size;
-			ol_read[i].Offset = ol_write[i].Offset;
-			ol_read[i].OffsetHigh = ol_write[i].OffsetHigh;
-		}
+		offset_refresh(operations_count, block_size, last_offset, ol_read, ol_write);
 
 		LARGE_INTEGER start_time, end_time, frequency;
 		QueryPerformanceFrequency(&frequency);
 		QueryPerformanceCounter(&start_time);
-		int curr_size = l_source_size;
 		do {
-			action_file_overlapped(ReadFileEx, source, block_size, operations_count, l_source_size, buffer, ol_read);
-			action_file_overlapped(WriteFileEx, copy, block_size, operations_count, l_source_size, buffer, ol_write);
-			curr_size -= block_size * operations_count;
-		} while (curr_size > 0);
+			action_file_overlapped(ReadFileEx, source, block_size, operations_count, *full_source_size, buffer, ol_read);
+			action_file_overlapped(WriteFileEx, copy, block_size, operations_count, *full_source_size, buffer, ol_write);
+			offset_refresh(operations_count, block_size, last_offset, ol_read, ol_write);
+			*full_source_size -= block_size * operations_count;
+		} while (*full_source_size > 0);
 		QueryPerformanceCounter(&end_time);
 
 		std::cout << "Time: " << time_calculation(start_time, end_time, frequency) << " microseconds." << std::endl;;
 
-		SetFilePointer(copy, l_source_size, nullptr, FILE_BEGIN);
+		long h = static_cast<uint32_t>(*h_source_size);
+		SetFilePointer(copy, l_source_size, &h, FILE_BEGIN);
 		SetEndOfFile(copy);
 		CloseHandle(source);
 		CloseHandle(copy);
@@ -123,5 +130,7 @@ void overlaped_copy(std::vector<std::string>* property) {
 			delete[] buffer[i];
 		delete[] buffer;
 		delete h_source_size;
+		delete full_source_size;
+		delete last_offset;
 	}
 }
